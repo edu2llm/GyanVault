@@ -12,7 +12,6 @@ import sys
 import time
 import json
 import random
-import sqlite3
 import logging
 import hashlib
 import argparse
@@ -26,23 +25,18 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 from datetime import datetime
 
-# ---------- CONFIG (Defaults, can be overridden by args) ----------
-OUTPUT_DIR = Path("output")
-DB_PATH = Path("downloads.db")
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-]
-
-MIN_DELAY = 2.5
-MAX_DELAY = 9.5
-TIMEOUT = 30
-MAX_RETRIES = 3
-CHUNK_SIZE = 1024 * 32
-TEMP_DIR = Path(".temp_downloads")
-# ----------------------------
+from gyanvault.config import (
+    OUTPUT_DIR,
+    DB_PATH,
+    USER_AGENTS,
+    MIN_DELAY,
+    MAX_DELAY,
+    TIMEOUT,
+    MAX_RETRIES,
+    DOWNLOAD_CHUNK_SIZE,
+    TEMP_DIR,
+)
+from gyanvault.db import DBManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -58,188 +52,11 @@ def normalize_url(url: str) -> str:
     return urlunparse(new)
 
 
-# ---------- DB helpers & migration ----------
-def init_db(path: Path):
-    created = not path.exists()
-    conn = sqlite3.connect(str(path))
-    cur = conn.cursor()
-    if created:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS downloads (
-                complete_url TEXT PRIMARY KEY,
-                institution TEXT,
-                type TEXT,
-                year TEXT,
-                class TEXT,
-                subject TEXT,
-                md5 TEXT,
-                size INTEGER,
-                path TEXT,
-                content_type TEXT,
-                etag TEXT,
-                last_modified TEXT,
-                pdfs_json TEXT,
-                ts TEXT
-            );
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS md5_map (
-                md5 TEXT PRIMARY KEY,
-                path TEXT,
-                size INTEGER,
-                ts TEXT
-            );
-            """
-        )
-        conn.commit()
-    else:
-        migrate_db(conn)
-    return conn
-
-
-def migrate_db(conn: sqlite3.Connection):
-    cur = conn.cursor()
-
-    def existing_columns(table):
-        cur.execute(f"PRAGMA table_info({table})")
-        return [r[1] for r in cur.fetchall()]
-
-    # downloads table expected columns
-    expected_downloads = {
-        "complete_url",
-        "institution",
-        "type",
-        "year",
-        "class",
-        "subject",
-        "md5",
-        "size",
-        "path",
-        "content_type",
-        "etag",
-        "last_modified",
-        "pdfs_json",
-        "ts",
-    }
-    try:
-        downloads_cols = existing_columns("downloads")
-    except sqlite3.OperationalError:
-        # missing downloads table -> create fresh
-        logging.info("DB migration: creating downloads table")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS downloads (
-                complete_url TEXT PRIMARY KEY,
-                institution TEXT,
-                type TEXT,
-                year TEXT,
-                class TEXT,
-                subject TEXT,
-                md5 TEXT,
-                size INTEGER,
-                path TEXT,
-                content_type TEXT,
-                etag TEXT,
-                last_modified TEXT,
-                pdfs_json TEXT,
-                ts TEXT
-            );
-            """
-        )
-        conn.commit()
-        downloads_cols = existing_columns("downloads")
-
-    missing = expected_downloads - set(downloads_cols)
-    for col in missing:
-        # choose types sensibly (TEXT for most, INTEGER for size)
-        typ = "INTEGER" if col == "size" else "TEXT"
-        logging.info(f"DB migration: adding column '{col}' to downloads (type {typ})")
-        cur.execute(f"ALTER TABLE downloads ADD COLUMN {col} {typ}")
-
-    # md5_map table
-    expected_md5map = {"md5", "path", "size", "ts"}
-    try:
-        md5map_cols = existing_columns("md5_map")
-    except sqlite3.OperationalError:
-        md5map_cols = []
-    if not md5map_cols:
-        logging.info("DB migration: creating md5_map table")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS md5_map (
-                md5 TEXT PRIMARY KEY,
-                path TEXT,
-                size INTEGER,
-                ts TEXT
-            );
-            """
-        )
-    else:
-        missing2 = expected_md5map - set(md5map_cols)
-        for col in missing2:
-            typ = "INTEGER" if col == "size" else "TEXT"
-            logging.info(f"DB migration: adding column '{col}' to md5_map (type {typ})")
-            cur.execute(f"ALTER TABLE md5_map ADD COLUMN {col} {typ}")
-
-    conn.commit()
-
-
-def db_get_download(conn, url: str):
-    cur = conn.cursor()
-    cur.execute("SELECT complete_url, institution, type, year, class, subject, md5, size, path, content_type, etag, last_modified, pdfs_json, ts FROM downloads WHERE complete_url = ?", (url,))
-    row = cur.fetchone()
-    if row:
-        keys = ["complete_url", "institution", "type", "year", "class", "subject", "md5", "size", "path", "content_type", "etag", "last_modified", "pdfs_json", "ts"]
-        res = dict(zip(keys, row))
-        # parse pdfs_json into list
-        if res.get("pdfs_json"):
-            try:
-                res["pdfs"] = json.loads(res["pdfs_json"])
-            except Exception:
-                res["pdfs"] = []
-        else:
-            res["pdfs"] = []
-        return res
-    return None
-
-
-def db_insert_download(conn, complete_url: str, institution: str, typ: str, year: str, cls: str, subject: str, md5: str, size: int, path: str, content_type: str, pdfs: list, etag: str = None, last_modified: str = None):
-    cur = conn.cursor()
-    pdfs_json = json.dumps(pdfs or [])
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO downloads(complete_url, institution, type, year, class, subject, md5, size, path, content_type, etag, last_modified, pdfs_json, ts)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (complete_url, institution or "", typ or "", year or "", cls or "", subject or "", md5 or "", size or 0, path or "", content_type or "", etag or "", last_modified or "", pdfs_json, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-
-
-def db_get_md5_map(conn, md5: str):
-    cur = conn.cursor()
-    cur.execute("SELECT md5, path, size, ts FROM md5_map WHERE md5 = ?", (md5,))
-    row = cur.fetchone()
-    if row:
-        keys = ["md5", "path", "size", "ts"]
-        return dict(zip(keys, row))
-    return None
-
-
-def db_insert_md5_map(conn, md5: str, path: str, size: int):
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO md5_map(md5, path, size, ts) VALUES (?, ?, ?, ?)", (md5, path, size, datetime.utcnow().isoformat()))
-    conn.commit()
-
-
 # ---------- utils ----------
 def md5_of_file(path: Path):
     h = hashlib.md5()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
+        for chunk in iter(lambda: f.read(DOWNLOAD_CHUNK_SIZE), b""):
             h.update(chunk)
     return h.hexdigest()
 
@@ -258,34 +75,23 @@ def sanitize(s: str) -> str:
 
 
 def dissect_url(url: str):
-    """
-    Break URL path into institution, type, year, class, subject (best-effort).
-    Example:
-      https://some-site.edu/papers/2024/Class-XII/Physics.pdf
-    -> institution=some-site.edu, type=papers, year=2024, class=Class-XII, subject=Physics.pdf
-    """
     parsed = urlparse(url)
     parts = [seg for seg in parsed.path.split("/") if seg]
-    
-    # Institution is derived from the domain name for better generality
     institution = parsed.netloc.replace("www.", "")
     typ = parts[1] if len(parts) >= 2 else ""
     year = None
     cls = None
     subject = None
 
-    # More generic regex to find year and class in URL segments
     for i, seg in enumerate(parts):
         m = re.match(r"^(20\d{2})", seg)
         if m:
             year = m.group(1)
-            # Check if the next segment looks like a class/grade
             if i + 1 < len(parts):
                 nxt = parts[i + 1]
                 if re.match(r"^(?:X{1,3}|I{1,3}V?|IV|V|VI{1,3}|IX|XI{0,2}|[0-9]{1,2}|Class-?[0-9]{1,2})$", nxt, flags=re.I):
                     cls = nxt
 
-    # subject fallback: last path part or filename
     if parts:
         subject = parts[-1]
     return {
@@ -349,7 +155,7 @@ def stream_download_to_temp(session: requests.Session, url: str, temp_path: Path
                 size = 0
                 temp_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(temp_path, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, leave=False, desc=temp_path.name) as pbar:
-                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                    for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                         if not chunk:
                             continue
                         f.write(chunk)
@@ -395,7 +201,6 @@ def parse_and_queue_downloads(page_html: str, base_url: str):
                 "institution": parts.get("institution") or "",
                 "type": parts.get("type") or "",
             })
-    # onclick JS with full URLs
     for el in soup.find_all(attrs={"onclick": True}):
         onclick = el.get("onclick") or ""
         m = re.search(r"(https?:\/\/[^\s'\"\\)]+?\.(?:pdf|zip))", onclick, flags=re.I)
@@ -447,7 +252,7 @@ def main():
 
     start_url = args.start_url
 
-    conn = init_db(DB_PATH)
+    db = DBManager(str(DB_PATH))
     session = get_session()
     TEMP_DIR.mkdir(exist_ok=True)
 
@@ -474,25 +279,23 @@ def main():
 
         logging.info(f"[{idx}/{len(queue)}] Processing: {url}")
 
-        # check existing
-        rec = db_get_download(conn, url)
+        rec = db.get_download(url)
         if rec:
             logging.info(f"Already downloaded: {url} -> {rec.get('path')} (skipping)")
             continue
 
-        # HEAD info (etag)
         head = head_check(session, url, referer=start_url)
         if head and head.get("etag"):
             logging.debug(f"HEAD ETag: {head.get('etag')} for {url}")
 
         polite_sleep()
 
-        # compute structured fields from URL (defensive)
+        dissected = dissect_url(url)
         institution = inst or dissected.get("institution") or ""
         typ_field = typ or dissected.get("type") or ""
         year = year_from_item or dissected.get("year") or ""
         cls = class_from_item or dissected.get("class") or ""
-        subject = subject_from_item or dissected.get("subject") or dissected.get("subject") or ""
+        subject = subject_from_item or dissected.get("subject") or ""
 
         folder = OUTPUT_DIR / (year or "unknown_year") / (cls or "unknown_class") / sanitize(subject)
         folder.mkdir(parents=True, exist_ok=True)
@@ -509,13 +312,11 @@ def main():
         size = info["size"]
         ctype = info.get("content_type", "")
 
-        # if content already exists by md5, don't duplicate; just reference existing path
-        md5rec = db_get_md5_map(conn, file_md5)
+        md5rec = db.get_md5_map(file_md5)
         if md5rec:
             existing_path = Path(md5rec["path"])
             logging.info(f"Content already exists (md5 match). Not duplicating. Using {existing_path}")
-            # record download metadata pointing to existing file and empty pdfs_json (we can fill later)
-            db_insert_download(conn, url, institution, typ_field, year, cls, subject, file_md5, size, str(existing_path), ctype, pdfs=[], etag=head.get("etag") if head else None, last_modified=head.get("last_modified") if head else None)
+            db.insert_download(url, institution, typ_field, year, cls, subject, file_md5, size, str(existing_path), ctype, pdfs=[], etag=head.get("etag") if head else None, last_modified=head.get("last_modified") if head else None)
             try:
                 temp_path.unlink()
             except Exception:
@@ -525,7 +326,6 @@ def main():
         is_zip = fname.lower().endswith(".zip") or ("zip" in (ctype or "").lower())
 
         if is_zip:
-            # move temp file into place as the zip
             zpath = folder / fname
             try:
                 tmpz = zpath.with_suffix(zpath.suffix + ".part")
@@ -543,7 +343,6 @@ def main():
                     logging.error(f"Failed saving zip to {zpath}: {e}")
                     continue
 
-            # extract PDFs
             saved_pdfs = extract_pdfs_from_zip(zpath, folder)
             pdfs_meta = []
             if saved_pdfs:
@@ -552,27 +351,23 @@ def main():
                     try:
                         p_md5 = md5_of_file(p)
                         p_size = p.stat().st_size
-                        db_insert_md5_map(conn, p_md5, str(p), p_size)
+                        db.insert_md5_map(p_md5, str(p), p_size)
                         pdfs_meta.append({"file": str(p.relative_to(OUTPUT_DIR)), "md5": p_md5, "size": p_size})
                     except Exception as e:
                         logging.warning(f"Failed to record md5 for {p}: {e}")
                         pdfs_meta.append({"file": str(p.relative_to(OUTPUT_DIR)), "md5": None, "size": p.stat().st_size if p.exists() else None})
-                # record the zip's md5 and that it was extracted
-                db_insert_md5_map(conn, file_md5, str(zpath), size)
-                db_insert_download(conn, url, institution, typ_field, year, cls, subject, file_md5, size, "zip_extracted_and_deleted", "application/zip", pdfs_meta, etag=head.get("etag") if head else None, last_modified=head.get("last_modified") if head else None)
-                # delete zip to save space
+                db.insert_md5_map(file_md5, str(zpath), size)
+                db.insert_download(url, institution, typ_field, year, cls, subject, file_md5, size, "zip_extracted_and_deleted", "application/zip", pdfs_meta, etag=head.get("etag") if head else None, last_modified=head.get("last_modified") if head else None)
                 try:
                     zpath.unlink()
                 except Exception:
                     pass
             else:
-                # no PDFs inside: keep zip and record it; pdfs_meta is empty
                 logging.info(f"No PDFs found in zip; kept zip at {zpath}")
-                db_insert_md5_map(conn, file_md5, str(zpath), size)
-                db_insert_download(conn, url, institution, typ_field, year, cls, subject, file_md5, size, str(zpath), "application/zip", pdfs_meta, etag=head.get("etag") if head else None, last_modified=head.get("last_modified") if head else None)
+                db.insert_md5_map(file_md5, str(zpath), size)
+                db.insert_download(url, institution, typ_field, year, cls, subject, file_md5, size, str(zpath), "application/zip", pdfs_meta, etag=head.get("etag") if head else None, last_modified=head.get("last_modified") if head else None)
             continue
 
-        # not a zip -- likely a single pdf or other file
         target = folder / fname
         try:
             tmp_target = target.with_suffix(target.suffix + ".part")
@@ -590,25 +385,22 @@ def main():
                 logging.error(f"Failed saving file to {target}: {e}")
                 continue
 
-        # compute actual md5 of saved file (safety)
         try:
             actual_md5 = md5_of_file(target)
         except Exception:
             actual_md5 = file_md5
 
-        # store md5_map and a single-entry pdfs list if it's a PDF
-        db_insert_md5_map(conn, actual_md5, str(target), target.stat().st_size if target.exists() else size)
+        db.insert_md5_map(actual_md5, str(target), target.stat().st_size if target.exists() else size)
         pdfs_meta = []
         if target.exists() and target.suffix.lower() == ".pdf":
             pdfs_meta.append({"file": str(target.relative_to(OUTPUT_DIR)), "md5": actual_md5, "size": target.stat().st_size})
         else:
-            # non-pdf single file; still record as pdfs_meta empty or with file
             pdfs_meta.append({"file": str(target.relative_to(OUTPUT_DIR)), "md5": actual_md5, "size": target.stat().st_size if target.exists() else size})
 
-        db_insert_download(conn, url, institution, typ_field, year, cls, subject, actual_md5, target.stat().st_size if target.exists() else size, str(target), ctype or "application/octet-stream", pdfs_meta, etag=head.get("etag") if head else None, last_modified=head.get("last_modified") if head else None)
+        db.insert_download(url, institution, typ_field, year, cls, subject, actual_md5, target.stat().st_size if target.exists() else size, str(target), ctype or "application/octet-stream", pdfs_meta, etag=head.get("etag") if head else None, last_modified=head.get("last_modified") if head else None)
         logging.info(f"Saved file: {target}")
 
-    conn.close()
+    db.close()
     logging.info("All done.")
 
 
